@@ -49,7 +49,7 @@ use kex::ClientKex;
 use log::{debug, error, trace, warn};
 use russh_util::time::Instant;
 use ssh_encoding::Decode;
-use ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
+use ssh_key::{Certificate, HashAlg, PrivateKey, PublicKey};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::pin;
 use tokio::sync::mpsc::{
@@ -80,6 +80,83 @@ mod session;
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_rsa_hash_from_server_sig_algs_prefers_sha512() {
+        let algs = vec![
+            "rsa-sha2-256-cert-v01@openssh.com".to_string(),
+            "rsa-sha2-512-cert-v01@openssh.com".to_string(),
+            "ssh-rsa-cert-v01@openssh.com".to_string(),
+        ];
+
+        assert_eq!(
+            select_rsa_hash_from_server_sig_algs(
+                &algs,
+                "rsa-sha2-512-cert-v01@openssh.com",
+                "rsa-sha2-256-cert-v01@openssh.com",
+                "ssh-rsa-cert-v01@openssh.com",
+            ),
+            Some(Some(HashAlg::Sha512))
+        );
+    }
+
+    #[test]
+    fn select_rsa_hash_from_server_sig_algs_falls_back_to_sha256() {
+        let algs = vec![
+            "ssh-rsa-cert-v01@openssh.com".to_string(),
+            "rsa-sha2-256-cert-v01@openssh.com".to_string(),
+        ];
+
+        assert_eq!(
+            select_rsa_hash_from_server_sig_algs(
+                &algs,
+                "rsa-sha2-512-cert-v01@openssh.com",
+                "rsa-sha2-256-cert-v01@openssh.com",
+                "ssh-rsa-cert-v01@openssh.com",
+            ),
+            Some(Some(HashAlg::Sha256))
+        );
+    }
+
+    #[test]
+    fn select_rsa_hash_from_server_sig_algs_keeps_legacy_when_only_legacy_is_available() {
+        let algs = vec!["ssh-rsa-cert-v01@openssh.com".to_string()];
+
+        assert_eq!(
+            select_rsa_hash_from_server_sig_algs(
+                &algs,
+                "rsa-sha2-512-cert-v01@openssh.com",
+                "rsa-sha2-256-cert-v01@openssh.com",
+                "ssh-rsa-cert-v01@openssh.com",
+            ),
+            Some(None)
+        );
+    }
+}
+
+fn select_rsa_hash_from_server_sig_algs(
+    server_sig_algs: &[String],
+    sha512_name: &str,
+    sha256_name: &str,
+    legacy_name: &str,
+) -> Option<Option<HashAlg>> {
+    [
+        (sha512_name, Some(HashAlg::Sha512)),
+        (sha256_name, Some(HashAlg::Sha256)),
+        (legacy_name, None),
+    ]
+    .into_iter()
+    .find_map(|(name, hash_alg)| {
+        server_sig_algs
+            .iter()
+            .any(|alg| alg == name)
+            .then_some(hash_alg)
+    })
+}
+
 /// Actual client session's state.
 ///
 /// It is in charge of multiplexing and keeping track of various channels
@@ -98,7 +175,7 @@ pub struct Session {
     inbound_channel_sender: Sender<Msg>,
     inbound_channel_receiver: Receiver<Msg>,
     open_global_requests: VecDeque<GlobalRequestResponse>,
-    server_sig_algs: Option<Vec<Algorithm>>,
+    server_sig_algs: Option<Vec<String>>,
 }
 
 impl Drop for Session {
@@ -201,7 +278,7 @@ pub enum Msg {
         reply_channel: oneshot::Sender<()>,
     },
     GetServerSigAlgs {
-        reply_channel: oneshot::Sender<Option<Vec<Algorithm>>>,
+        reply_channel: oneshot::Sender<Option<Vec<String>>>,
     },
     /// Send a keepalive packet to the remote
     Keepalive {
@@ -439,11 +516,34 @@ impl<H: Handler> Handle<H> {
         key: Arc<PrivateKey>,
         cert: Certificate,
     ) -> Result<AuthResult, crate::Error> {
+        let hash_alg = if key.algorithm().is_rsa() {
+            self.best_supported_rsa_certificate_hash().await?.flatten()
+        } else {
+            None
+        };
+        self.authenticate_openssh_cert_with_hash(user, key, cert, hash_alg)
+            .await
+    }
+
+    /// Perform public OpenSSH Certificate-based SSH authentication with an
+    /// explicit RSA signature hash. For RSA certificates, `None` selects the
+    /// legacy `ssh-rsa-cert-v01@openssh.com` algorithm.
+    pub async fn authenticate_openssh_cert_with_hash<U: Into<String>>(
+        &mut self,
+        user: U,
+        key: Arc<PrivateKey>,
+        cert: Certificate,
+        hash_alg: Option<HashAlg>,
+    ) -> Result<AuthResult, crate::Error> {
         let user = user.into();
         self.sender
             .send(Msg::Authenticate {
                 user,
-                method: auth::Method::OpenSshCertificate { key, cert },
+                method: auth::Method::OpenSshCertificate {
+                    key,
+                    cert,
+                    hash_alg,
+                },
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
@@ -622,8 +722,26 @@ impl<H: Handler> Handle<H> {
         Ok(())
     }
 
-    /// Returns the best RSA hash algorithm supported by the server,
-    /// as indicated by the `server-sig-algs` extension.
+    async fn server_sig_algs(&self) -> Result<Option<Vec<String>>, Error> {
+        // Wait for the extension info from the server
+        #[cfg(not(target_arch = "wasm32"))]
+        self.await_extension_info("server-sig-algs".into()).await?;
+
+        let (sender, receiver) = oneshot::channel();
+
+        self.sender
+            .send(Msg::GetServerSigAlgs {
+                reply_channel: sender,
+            })
+            .await
+            .map_err(|_| crate::Error::SendError)?;
+
+        receiver.await.map_err(|_| Error::Inconsistent)
+    }
+
+    /// Returns the best RSA hash algorithm supported by the server for plain
+    /// public-key authentication, as indicated by the `server-sig-algs`
+    /// extension.
     /// If the server does not support the extension,
     /// `None` is returned. In this case you may still attempt an authentication
     /// with `rsa-sha2-256` or `rsa-sha2-512` and hope for the best.
@@ -638,30 +756,31 @@ impl<H: Handler> Handle<H> {
     /// If this method returns `None` once, then for most SSH servers
     /// you can assume that it will return `None` every time.
     pub async fn best_supported_rsa_hash(&self) -> Result<Option<Option<HashAlg>>, Error> {
-        // Wait for the extension info from the server
-        #[cfg(not(target_arch = "wasm32"))]
-        self.await_extension_info("server-sig-algs".into()).await?;
+        if let Some(server_sig_algs) = self.server_sig_algs().await? {
+            return Ok(select_rsa_hash_from_server_sig_algs(
+                &server_sig_algs,
+                "rsa-sha2-512",
+                "rsa-sha2-256",
+                "ssh-rsa",
+            ));
+        }
 
-        let (sender, receiver) = oneshot::channel();
+        Ok(None)
+    }
 
-        self.sender
-            .send(Msg::GetServerSigAlgs {
-                reply_channel: sender,
-            })
-            .await
-            .map_err(|_| crate::Error::SendError)?;
-
-        if let Some(ssa) = receiver.await.map_err(|_| Error::Inconsistent)? {
-            let possible_algs = [
-                Some(ssh_key::HashAlg::Sha512),
-                Some(ssh_key::HashAlg::Sha256),
-                None,
-            ];
-            for alg in possible_algs.into_iter() {
-                if ssa.contains(&Algorithm::Rsa { hash: alg }) {
-                    return Ok(Some(alg));
-                }
-            }
+    /// Returns the best RSA hash algorithm supported by the server for OpenSSH
+    /// certificate authentication, as indicated by the `server-sig-algs`
+    /// extension.
+    pub async fn best_supported_rsa_certificate_hash(
+        &self,
+    ) -> Result<Option<Option<HashAlg>>, Error> {
+        if let Some(server_sig_algs) = self.server_sig_algs().await? {
+            return Ok(select_rsa_hash_from_server_sig_algs(
+                &server_sig_algs,
+                "rsa-sha2-512-cert-v01@openssh.com",
+                "rsa-sha2-256-cert-v01@openssh.com",
+                "ssh-rsa-cert-v01@openssh.com",
+            ));
         }
 
         Ok(None)

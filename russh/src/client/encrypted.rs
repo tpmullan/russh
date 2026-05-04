@@ -13,26 +13,31 @@
 // limitations under the License.
 //
 use std::convert::TryInto;
-use std::ops::Deref;
-use std::str::FromStr;
 
 use bytes::Bytes;
 use log::{debug, error, info, trace, warn};
 use ssh_encoding::{Decode, Encode, Reader};
-use ssh_key::Algorithm;
+use ssh_key::{Algorithm, HashAlg};
 
 use super::IncomingSshPacket;
 use crate::auth::AuthRequest;
 use crate::cert::PublicKeyOrCertificate;
 use crate::client::{Handler, Msg, Prompt, Reply, Session};
-use crate::helpers::{AlgorithmExt, EncodedExt, NameList, sign_with_hash_alg};
-use crate::keys::key::parse_public_key;
+use crate::helpers::{AlgorithmExt, NameList, sign_with_hash_alg};
+use crate::keys::key::{parse_public_key, PrivateKeyWithHashAlg};
 use crate::parsing::{ChannelOpenConfirmation, ChannelType, OpenChannelMessage};
 use crate::session::{Encrypted, EncryptedState, GlobalRequestResponse};
 use crate::{
     Channel, ChannelId, ChannelMsg, ChannelOpenFailure, ChannelParams, Error, MethodSet, Sig, auth,
     map_err, msg,
 };
+
+fn rsa_certificate_auth_algorithm(algorithm: Algorithm, hash_alg: Option<HashAlg>) -> Algorithm {
+    match algorithm {
+        Algorithm::Rsa { .. } => Algorithm::Rsa { hash: hash_alg },
+        algorithm => algorithm,
+    }
+}
 
 impl Session {
     pub(crate) async fn client_read_encrypted<H: Handler>(
@@ -225,6 +230,7 @@ impl Session {
                                             key: key.clone(),
                                             hash_alg,
                                         },
+                                        None,
                                         &mut self.common.buffer,
                                     )?;
                                     let len = self.common.buffer.len();
@@ -254,6 +260,7 @@ impl Session {
                                     let i = enc.client_make_to_sign(
                                         &self.common.auth_user,
                                         &PublicKeyOrCertificate::Certificate(cert.clone()),
+                                        hash_alg,
                                         &mut self.common.buffer,
                                     )?;
                                     let len = self.common.buffer.len();
@@ -333,10 +340,10 @@ impl Session {
         self.server_sig_algs = Some(
             algs.0
                 .iter()
-                .filter_map(|x| Algorithm::from_str(x).ok())
                 .inspect(|x| {
                     debug!("  * {x:?}");
                 })
+                .cloned()
                 .collect::<Vec<_>>(),
         );
         Ok(())
@@ -948,16 +955,24 @@ impl Encrypted {
                     key.public_key().to_bytes()?.encode(&mut self.write)?;
                     true
                 }
-                auth::Method::OpenSshCertificate { ref cert, .. } => {
+                auth::Method::OpenSshCertificate {
+                    ref cert,
+                    hash_alg,
+                    ..
+                } => {
                     user.as_bytes().encode(&mut self.write)?;
                     "ssh-connection".encode(&mut self.write)?;
                     "publickey".encode(&mut self.write)?;
                     self.write.push(0); // This is a probe
 
-                    debug!("write_auth_request: cert - {:?}", cert.algorithm());
-                    cert.algorithm()
-                        .to_certificate_type()
-                        .encode(&mut self.write)?;
+                    let cert_algo = cert.algorithm();
+                    let auth_algo = rsa_certificate_auth_algorithm(cert_algo.clone(), hash_alg);
+                    let cert_type = auth_algo.to_certificate_type();
+                    debug!(
+                        "write_auth_request: cert - {:?} (cert_type: {})",
+                        cert_algo, cert_type
+                    );
+                    cert_type.encode(&mut self.write)?;
                     cert.to_bytes()?.as_slice().encode(&mut self.write)?;
                     true
                 }
@@ -975,13 +990,13 @@ impl Encrypted {
                     key.to_bytes()?.as_slice().encode(&mut self.write)?;
                     true
                 }
-                auth::Method::FutureCertificate { ref cert, .. } => {
+                auth::Method::FutureCertificate { ref cert, hash_alg } => {
                     user.as_bytes().encode(&mut self.write)?;
                     "ssh-connection".encode(&mut self.write)?;
                     "publickey".encode(&mut self.write)?;
                     self.write.push(0); // This is a probe
 
-                    cert.algorithm()
+                    rsa_certificate_auth_algorithm(cert.algorithm(), hash_alg)
                         .to_certificate_type()
                         .encode(&mut self.write)?;
                     cert.to_bytes()?.as_slice().encode(&mut self.write)?;
@@ -1004,6 +1019,7 @@ impl Encrypted {
         &mut self,
         user: &str,
         key: &PublicKeyOrCertificate,
+        certificate_hash_alg: Option<HashAlg>,
         buffer: &mut Vec<u8>,
     ) -> Result<usize, crate::Error> {
         buffer.clear();
@@ -1018,7 +1034,9 @@ impl Encrypted {
 
         match key {
             PublicKeyOrCertificate::Certificate(cert) => {
-                cert.algorithm().to_certificate_type().encode(buffer)?;
+                rsa_certificate_auth_algorithm(cert.algorithm(), certificate_hash_alg)
+                    .to_certificate_type()
+                    .encode(buffer)?;
                 cert.to_bytes()?.encode(buffer)?;
             }
             PublicKeyOrCertificate::PublicKey { key, hash_alg } => {
@@ -1037,8 +1055,12 @@ impl Encrypted {
     ) -> Result<(), crate::Error> {
         match method {
             auth::Method::PublicKey { key } => {
-                let i0 =
-                    self.client_make_to_sign(user, &PublicKeyOrCertificate::from(key), buffer)?;
+                let i0 = self.client_make_to_sign(
+                    user,
+                    &PublicKeyOrCertificate::from(key),
+                    None,
+                    buffer,
+                )?;
 
                 // Extend with self-signature.
                 sign_with_hash_alg(key, buffer)?.encode(&mut *buffer)?;
@@ -1048,16 +1070,19 @@ impl Encrypted {
                     self.write.extend_from_slice(&buffer[i0..]);
                 })
             }
-            auth::Method::OpenSshCertificate { key, cert } => {
+            auth::Method::OpenSshCertificate {
+                key,
+                cert,
+                hash_alg,
+            } => {
                 let i0 = self.client_make_to_sign(
                     user,
                     &PublicKeyOrCertificate::Certificate(cert.clone()),
+                    *hash_alg,
                     buffer,
                 )?;
 
-                // Extend with self-signature.
-                signature::Signer::try_sign(key.deref(), buffer)?
-                    .encoded()?
+                sign_with_hash_alg(&PrivateKeyWithHashAlg::new(key.clone(), *hash_alg), buffer)?
                     .encode(&mut *buffer)?;
 
                 push_packet!(self.write, {
@@ -1080,5 +1105,46 @@ impl Encrypted {
             }
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rsa_certificate_auth_algorithm_keeps_legacy_rsa_without_hash() {
+        assert_eq!(
+            rsa_certificate_auth_algorithm(Algorithm::Rsa { hash: None }, None),
+            Algorithm::Rsa { hash: None }
+        );
+    }
+
+    #[test]
+    fn rsa_certificate_auth_algorithm_respects_sha512() {
+        assert_eq!(
+            rsa_certificate_auth_algorithm(Algorithm::Rsa { hash: None }, Some(HashAlg::Sha512)),
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512)
+            }
+        );
+    }
+
+    #[test]
+    fn rsa_certificate_auth_algorithm_keeps_non_rsa() {
+        assert_eq!(
+            rsa_certificate_auth_algorithm(Algorithm::Ed25519, None),
+            Algorithm::Ed25519
+        );
+    }
+
+    #[test]
+    fn rsa_certificate_auth_algorithm_respects_explicit_rsa_hash() {
+        assert_eq!(
+            rsa_certificate_auth_algorithm(Algorithm::Rsa { hash: None }, Some(HashAlg::Sha256)),
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha256)
+            }
+        );
     }
 }
