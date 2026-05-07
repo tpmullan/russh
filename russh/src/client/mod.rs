@@ -87,17 +87,17 @@ mod tests {
     #[test]
     fn select_rsa_hash_from_server_sig_algs_prefers_sha512() {
         let algs = vec![
-            "rsa-sha2-256-cert-v01@openssh.com".to_string(),
-            "rsa-sha2-512-cert-v01@openssh.com".to_string(),
-            "ssh-rsa-cert-v01@openssh.com".to_string(),
+            "rsa-sha2-256".to_string(),
+            "rsa-sha2-512".to_string(),
+            "ssh-rsa".to_string(),
         ];
 
         assert_eq!(
             select_rsa_hash_from_server_sig_algs(
                 &algs,
-                "rsa-sha2-512-cert-v01@openssh.com",
-                "rsa-sha2-256-cert-v01@openssh.com",
-                "ssh-rsa-cert-v01@openssh.com",
+                &["rsa-sha2-512"],
+                &["rsa-sha2-256"],
+                &["ssh-rsa"],
             ),
             Some(Some(HashAlg::Sha512))
         );
@@ -113,9 +113,9 @@ mod tests {
         assert_eq!(
             select_rsa_hash_from_server_sig_algs(
                 &algs,
-                "rsa-sha2-512-cert-v01@openssh.com",
-                "rsa-sha2-256-cert-v01@openssh.com",
-                "ssh-rsa-cert-v01@openssh.com",
+                &["rsa-sha2-512-cert-v01@openssh.com"],
+                &["rsa-sha2-256-cert-v01@openssh.com"],
+                &["ssh-rsa-cert-v01@openssh.com"],
             ),
             Some(Some(HashAlg::Sha256))
         );
@@ -128,31 +128,50 @@ mod tests {
         assert_eq!(
             select_rsa_hash_from_server_sig_algs(
                 &algs,
-                "rsa-sha2-512-cert-v01@openssh.com",
-                "rsa-sha2-256-cert-v01@openssh.com",
-                "ssh-rsa-cert-v01@openssh.com",
+                &["rsa-sha2-512-cert-v01@openssh.com"],
+                &["rsa-sha2-256-cert-v01@openssh.com"],
+                &["ssh-rsa-cert-v01@openssh.com"],
             ),
             Some(None)
+        );
+    }
+
+    #[test]
+    fn select_rsa_hash_from_server_sig_algs_accepts_cert_aliases() {
+        let algs = vec![
+            "ssh-rsa".to_string(),
+            "rsa-sha2-256".to_string(),
+            "rsa-sha2-512".to_string(),
+        ];
+
+        assert_eq!(
+            select_rsa_hash_from_server_sig_algs(
+                &algs,
+                &["rsa-sha2-512-cert-v01@openssh.com", "rsa-sha2-512"],
+                &["rsa-sha2-256-cert-v01@openssh.com", "rsa-sha2-256"],
+                &["ssh-rsa-cert-v01@openssh.com", "ssh-rsa"],
+            ),
+            Some(Some(HashAlg::Sha512))
         );
     }
 }
 
 fn select_rsa_hash_from_server_sig_algs(
     server_sig_algs: &[String],
-    sha512_name: &str,
-    sha256_name: &str,
-    legacy_name: &str,
+    sha512_names: &[&str],
+    sha256_names: &[&str],
+    legacy_names: &[&str],
 ) -> Option<Option<HashAlg>> {
     [
-        (sha512_name, Some(HashAlg::Sha512)),
-        (sha256_name, Some(HashAlg::Sha256)),
-        (legacy_name, None),
+        (sha512_names, Some(HashAlg::Sha512)),
+        (sha256_names, Some(HashAlg::Sha256)),
+        (legacy_names, None),
     ]
     .into_iter()
-    .find_map(|(name, hash_alg)| {
-        server_sig_algs
+    .find_map(|(names, hash_alg)| {
+        names
             .iter()
-            .any(|alg| alg == name)
+            .any(|name| server_sig_algs.iter().any(|alg| alg == name))
             .then_some(hash_alg)
     })
 }
@@ -759,9 +778,9 @@ impl<H: Handler> Handle<H> {
         if let Some(server_sig_algs) = self.server_sig_algs().await? {
             return Ok(select_rsa_hash_from_server_sig_algs(
                 &server_sig_algs,
-                "rsa-sha2-512",
-                "rsa-sha2-256",
-                "ssh-rsa",
+                &["rsa-sha2-512"],
+                &["rsa-sha2-256"],
+                &["ssh-rsa"],
             ));
         }
 
@@ -777,9 +796,9 @@ impl<H: Handler> Handle<H> {
         if let Some(server_sig_algs) = self.server_sig_algs().await? {
             return Ok(select_rsa_hash_from_server_sig_algs(
                 &server_sig_algs,
-                "rsa-sha2-512-cert-v01@openssh.com",
-                "rsa-sha2-256-cert-v01@openssh.com",
-                "ssh-rsa-cert-v01@openssh.com",
+                &["rsa-sha2-512-cert-v01@openssh.com", "rsa-sha2-512"],
+                &["rsa-sha2-256-cert-v01@openssh.com", "rsa-sha2-256"],
+                &["ssh-rsa-cert-v01@openssh.com", "ssh-rsa"],
             ));
         }
 
