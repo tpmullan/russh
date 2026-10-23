@@ -1272,7 +1272,7 @@ mod tests {
         ensure_end(&mic).unwrap();
     }
 
-    fn rsa_user_certificate() -> ssh_key::Certificate {
+    fn rsa_user_identity() -> (std::sync::Arc<ssh_key::PrivateKey>, ssh_key::Certificate) {
         let subject =
             ssh_key::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Rsa { hash: None })
                 .unwrap();
@@ -1290,7 +1290,12 @@ mod tests {
             .cert_type(ssh_key::certificate::CertType::User)
             .unwrap();
         builder.valid_principal("alice").unwrap();
-        builder.sign(&ca).unwrap()
+        let certificate = builder.sign(&ca).unwrap();
+        (std::sync::Arc::new(subject), certificate)
+    }
+
+    fn rsa_user_certificate() -> ssh_key::Certificate {
+        rsa_user_identity().1
     }
 
     fn decode_userauth_certificate_algorithm(
@@ -1309,6 +1314,61 @@ mod tests {
         let _certificate = Vec::<u8>::decode(&mut request).unwrap();
         ensure_end(&request).unwrap();
         algorithm
+    }
+
+    #[cfg(feature = "rsa")]
+    #[test]
+    fn rsa_disk_certificate_probe_and_signature_use_selected_hash()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (key, certificate) = rsa_user_identity();
+        for (hash_alg, expected) in [
+            (Some(HashAlg::Sha512), "rsa-sha2-512-cert-v01@openssh.com"),
+            (Some(HashAlg::Sha256), "rsa-sha2-256-cert-v01@openssh.com"),
+            (None, "ssh-rsa-cert-v01@openssh.com"),
+        ] {
+            let method = auth::Method::OpenSshCertificate {
+                key: key.clone(),
+                cert: certificate.clone(),
+                hash_alg,
+            };
+            let mut encrypted = test_encrypted();
+            encrypted.write_auth_request("alice", &method)?;
+            let probe = payloads(&encrypted.write);
+            assert_eq!(probe.len(), 1);
+            assert_eq!(
+                decode_userauth_certificate_algorithm(
+                    *probe.first().ok_or("missing probe")?,
+                    false
+                ),
+                expected
+            );
+
+            encrypted.write.clear();
+            encrypted.client_send_signature("alice", &method, &mut Vec::new())?;
+            let packets = payloads(&encrypted.write);
+            assert_eq!(packets.len(), 1);
+            let packet = *packets.first().ok_or("missing signed request")?;
+            let mut request = packet;
+            assert_eq!(u8::decode(&mut request)?, msg::USERAUTH_REQUEST);
+            assert_eq!(String::decode(&mut request)?, "alice");
+            assert_eq!(String::decode(&mut request)?, "ssh-connection");
+            assert_eq!(String::decode(&mut request)?, "publickey");
+            assert_eq!(u8::decode(&mut request)?, 1);
+            assert_eq!(String::decode(&mut request)?, expected);
+            assert_eq!(Vec::<u8>::decode(&mut request)?, certificate.to_bytes()?);
+            let signed_len = packet.len() - request.len();
+            let signature_bytes = Vec::<u8>::decode(&mut request)?;
+            ensure_end(&request)?;
+            let mut signature_reader = signature_bytes.as_slice();
+            let signature = Signature::decode(&mut signature_reader)?;
+            ensure_end(&signature_reader)?;
+            assert_eq!(signature.algorithm(), Algorithm::Rsa { hash: hash_alg });
+            let mut signed = Vec::new();
+            b"session-id".as_slice().encode(&mut signed)?;
+            signed.extend_from_slice(packet.get(..signed_len).ok_or("invalid signed length")?);
+            signature::Verifier::verify(key.public_key(), &signed, &signature)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "rsa")]
@@ -1402,9 +1462,7 @@ impl Encrypted {
                     true
                 }
                 auth::Method::OpenSshCertificate {
-                    ref cert,
-                    hash_alg,
-                    ..
+                    ref cert, hash_alg, ..
                 } => {
                     user.as_bytes().encode(&mut self.write)?;
                     "ssh-connection".encode(&mut self.write)?;

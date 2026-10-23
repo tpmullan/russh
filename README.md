@@ -11,6 +11,21 @@ Russh gives you direct access to the SSH protocol: channels, authentication, key
 - **Broad interoperability** - safe algorithms by default, with opt-in support for legacy ones
 - **Safety-focused** - panics, `unwrap`/`expect` and unchecked indexing are denied by default
 
+## RSA certificate authentication fork
+
+The `tpmullan/rsa-sha2-cert-auth` branch is based on upstream russh 0.64.1
+(`e5d80a07dc554480b6ea3b2e14adfc190407b627`). It retains dynamic RSA
+certificate signature selection from `server-sig-algs`, including plain RSA
+algorithm aliases advertised by OpenSSH servers. Disk-key authentication keeps
+the certificate algorithm in the probe and signed request consistent with the
+signature hash. Callers can select a hash explicitly with
+`authenticate_openssh_cert_with_hash`; agent-backed certificate authentication
+continues to honor the caller's hash selection.
+
+Regression tests cover SHA-512, SHA-256, legacy RSA, non-RSA certificates, and
+alias selection. The disk-key test verifies both the encoded wire algorithm
+and the resulting signature; upstream agent-certificate tests are retained.
+
 ## Getting started
 
 Add russh to your `Cargo.toml`, choosing a crypto backend feature (see below):
